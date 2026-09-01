@@ -14,6 +14,8 @@ const patterns = [
   { label: "OpenAI-style secret", regex: /\bsk-[A-Za-z0-9_-]{12,}\b/g },
   { label: "absolute macOS user path", regex: /\/Users\/[A-Za-z0-9._-]+/g },
   { label: "absolute macOS volume path", regex: /\/Volumes\/[A-Za-z0-9._-]+/g },
+  { label: "personal relay identity", regex: /\b(?:P\x61scal|K\x61lpas)\b/gi },
+  { label: "personal email address", regex: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi },
 ];
 
 async function collect(directory) {

@@ -27,4 +27,4 @@ Dynamic-card and run-viewer output is redacted on a best-effort basis. Never ass
 
 ## Reporting
 
-Before a public remote is created, define a private vulnerability-reporting address and add it here. Until then, do not publish suspected vulnerabilities in a public issue.
+Report vulnerabilities through this repository's **Security > Advisories > Report a vulnerability** flow. Do not publish suspected vulnerabilities in a public issue.

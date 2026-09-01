@@ -84,7 +84,7 @@ lark-cli event schema im.message.receive_v1 --json
 ### 3. 安装 codex-lark
 
 ```bash
-git clone <your-repository-url> codex-lark
+git clone https://github.com/Huyongyi-cpu/codex-relay.git codex-lark
 cd codex-lark
 cp .env.example .env
 npm run setup -- --owner-open-id ou_your_open_id --workdir "$HOME/workspace"

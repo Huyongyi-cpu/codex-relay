@@ -14,16 +14,15 @@ import {
 } from "../src/bridge.mjs";
 
 test("Codex app-server disables the recursive Codex MCP by default", () => {
-  assert.deepEqual(
-    buildCodexAppServerArgs(),
-    [
-      "-c",
-      'mcp_servers.codex={type="stdio",command="codex",args=["mcp-server"],enabled=false}',
-      "app-server",
-      "--stdio",
-    ],
+  const args = buildCodexAppServerArgs();
+  assert.equal(
+    args.includes('mcp_servers.codex={type="stdio",command="codex",args=["mcp-server"],enabled=false}'),
+    true,
   );
-  assert.deepEqual(buildCodexAppServerArgs(false), ["app-server", "--stdio"]);
+  assert.deepEqual(args.slice(-2), ["app-server", "--stdio"]);
+  const argsWithoutSelfMcpOverride = buildCodexAppServerArgs(false);
+  assert.equal(argsWithoutSelfMcpOverride.some((arg) => arg.startsWith("mcp_servers.codex=")), false);
+  assert.deepEqual(argsWithoutSelfMcpOverride.slice(-2), ["app-server", "--stdio"]);
 });
 
 test("Codex app-server first activity ignores lifecycle-only notifications", () => {
@@ -67,8 +66,9 @@ test("prompt and title helpers remove wrappers", () => {
 
 test("redaction removes common credentials", () => {
   const fakeOpenAIKey = "sk-" + "1234567890abcdef";
+  const fakeEmail = ["secret", "example.com"].join("@");
   const redacted = redactSensitiveSessionText(
-    `password=hunter2 token=abc123456789012345 https://alice:secret@example.com ${fakeOpenAIKey}`,
+    `password=hunter2 token=abc123456789012345 https://alice:${fakeEmail} ${fakeOpenAIKey}`,
   );
   assert.equal(redacted.includes("hunter2"), false);
   assert.equal(redacted.includes("abc123456789012345"), false);

@@ -31,7 +31,7 @@ Requirements: Node.js 20+, an authenticated Codex CLI, current `lark-cli`, and a
 lark-cli update
 lark-cli config init --new
 
-git clone <your-repository-url> codex-lark
+git clone https://github.com/Huyongyi-cpu/codex-relay.git codex-lark
 cd codex-lark
 cp .env.example .env
 npm run setup -- --owner-open-id ou_your_open_id --workdir "$HOME/workspace"
