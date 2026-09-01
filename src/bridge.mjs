@@ -100,6 +100,8 @@ const CONFIG = {
   dynamicCardFinalChars: Number.parseInt(env("LARK_CODEX_DYNAMIC_CARD_FINAL_CHARS", "2000"), 10),
   dynamicCardSuppressProgressMessages: envBool("LARK_CODEX_DYNAMIC_CARD_SUPPRESS_PROGRESS_MESSAGES", true),
   dynamicCardShowResult: envBool("LARK_CODEX_DYNAMIC_CARD_SHOW_RESULT", true),
+  confirmationCardsEnabled: envBool("LARK_CODEX_CONFIRMATION_CARDS_ENABLED", true),
+  confirmationTtlHours: Number.parseInt(env("LARK_CODEX_CONFIRMATION_TTL_HOURS", "24"), 10),
   runViewerEnabled: envBool("LARK_CODEX_RUN_VIEWER_ENABLED", true),
   runViewerHost: env("LARK_CODEX_RUN_VIEWER_HOST", "127.0.0.1"),
   runViewerPort: Number.parseInt(env("LARK_CODEX_RUN_VIEWER_PORT", "8765"), 10),
@@ -177,6 +179,7 @@ const CONFIG = {
 const runRoot = join(rootDir, ".lark-codex", "runs");
 const p2pStatePath = join(rootDir, ".lark-codex", "p2p-auto-reply-state.json");
 const sessionRegistryPath = join(rootDir, ".lark-codex", "sessions.json");
+const pendingConfirmationsPath = join(rootDir, ".lark-codex", "pending-confirmations.json");
 const codexHome = resolve(process.env.CODEX_HOME || join(homedir(), ".codex"));
 const codexSessionsRoot = join(codexHome, "sessions");
 const codexSessionIndexPath = join(codexHome, "session_index.jsonl");
@@ -193,6 +196,7 @@ const state = {
   p2pAutoReplyNotBeforeMs: Date.now(),
   p2pAutoReplyPolling: false,
   cardUpdates: new Map(),
+  cardActionSeen: new Set(),
 };
 
 if (isMainModule()) {
@@ -242,6 +246,7 @@ async function main() {
   } else {
     console.log("[bridge] bot event stream disabled (LARK_CODEX_BOT_EVENTS_ENABLED=0)");
   }
+  if (CONFIG.confirmationCardsEnabled) startCardActionConsumer();
   startP2PAutoReplyPoller();
 }
 
@@ -273,6 +278,12 @@ async function checkSetup(auth) {
   console.log(`[check] exec timeout: ${Math.round(effectiveExecTimeoutMs() / 1000)}s`);
   console.log(`[check] progress updates: ${CONFIG.progressEnabled ? `on, initial=${effectiveProgressInitialDelayMs() / 1000}s, interval=${effectiveProgressIntervalMs() / 1000}s, max=${effectiveProgressMaxUpdates()}` : "off"}`);
   console.log(`[check] dynamic card: ${CONFIG.dynamicCardEnabled ? `on, interval=${effectiveDynamicCardUpdateIntervalMs() / 1000}s, max-events=${effectiveDynamicCardMaxEvents()}` : "off"}`);
+  if (CONFIG.confirmationCardsEnabled) {
+    await runCommand("lark-cli", ["event", "schema", "card.action.trigger", "--json"], { cwd: rootDir });
+    console.log(`[check] confirmation cards: on, ttl=${effectiveConfirmationTtlHours()}h`);
+  } else {
+    console.log("[check] confirmation cards: off");
+  }
   console.log(`[check] run viewer: ${CONFIG.runViewerEnabled ? `${runViewerBaseUrl()} (${CONFIG.runViewerSendCard ? "card/link" : "state-only"})` : "off"}`);
   console.log(`[check] session backend: ${CONFIG.sessionBackend}`);
   console.log(`[check] app-server approval policy: ${appServerApprovalPolicy() || "(default)"}`);
@@ -458,14 +469,14 @@ function buildRunStatusCard(status, events = []) {
   const updated = status.updated_at ? formatLocalTime(status.updated_at) : "";
   const elapsed = status.elapsed_sec ? `${status.elapsed_sec}s` : runningElapsedText(status);
   const task = compactProgressText(displayRunTask(status.task || ""), effectiveDynamicCardTaskChars());
-  const eventLines = events.slice(-effectiveDynamicCardMaxEvents()).map((item) => {
-    const time = item.ts ? formatLocalTime(item.ts) : "";
-    return `- ${time ? `${time} ` : ""}${compactProgressText(item.text || item.type || "", effectiveDynamicCardEventChars())}`;
+  const eventLines = unique(events.map(humanizeRunStatusEvent).filter(Boolean))
+    .slice(-effectiveDynamicCardMaxEvents())
+    .map((text) => {
+      return `- ${compactProgressText(text, effectiveDynamicCardEventChars())}`;
   });
   const lines = [
     `**${stateText}**${elapsed ? `  耗时：${elapsed}` : ""}`,
     updated ? `更新时间：${updated}` : "",
-    status.session_alias ? `会话：\`${status.session_alias}\`` : "",
     task ? `任务：${task}` : "",
   ].filter(Boolean);
   const elements = [
@@ -480,27 +491,6 @@ function buildRunStatusCard(status, events = []) {
       text: { tag: "lark_md", content: ["**最近进度**", ...eventLines].join("\n") },
     });
   }
-  const finalText = status.status === "failed"
-    ? status.error || status.last_event || ""
-    : status.status === "completed"
-      ? status.final_message || status.last_event || ""
-      : "";
-  if (finalText && CONFIG.dynamicCardShowResult) {
-    elements.push({
-      tag: "div",
-      text: { tag: "lark_md", content: `**${status.status === "failed" ? "错误" : "结果"}**\n${compactProgressText(finalText, effectiveDynamicCardFinalChars())}` },
-    });
-  }
-  elements.push({
-    tag: "hr",
-  });
-  elements.push({
-    tag: "note",
-    elements: [
-      { tag: "plain_text", content: "动态卡片会限频更新；不暴露本机链接。" },
-    ],
-  });
-
   return {
     config: { wide_screen_mode: true },
     header: {
@@ -509,6 +499,19 @@ function buildRunStatusCard(status, events = []) {
     },
     elements,
   };
+}
+
+function humanizeRunStatusEvent(item) {
+  const text = String(item?.text || "").trim();
+  if (!text) return "";
+  if (/执行命令|调用工具|处理：?userMessage|开始分析|完成分析|P2P session|自动回复 session/.test(text)) return "";
+  if (/线程已恢复/.test(text)) return "已经接上之前的上下文";
+  if (/线程已创建/.test(text)) return "已经准备好新的上下文";
+  if (/开始执行/.test(text)) return "正在处理";
+  if (/正在生成回复/.test(text)) return "正在整理回复";
+  if (/正在收尾/.test(text)) return "马上好";
+  if (/已清理进行中表情/.test(text)) return "";
+  return text;
 }
 
 function runMessageTargetArgs(event, options = {}) {
@@ -1046,6 +1049,103 @@ function startEventConsumer() {
   process.once("SIGTERM", shutdown);
 }
 
+function startCardActionConsumer() {
+  const child = spawnCommand("lark-cli", ["event", "consume", "card.action.trigger", "--as", "bot"], {
+    cwd: rootDir,
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let buffer = "";
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (line.trim()) void handleCardActionLine(line);
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    for (const line of chunk.split(/\r?\n/)) {
+      if (line.trim()) console.error(line);
+    }
+  });
+  child.on("exit", (code, signal) => {
+    console.error(`[bridge] card action consumer exited code=${code} signal=${signal || ""}`);
+  });
+  const shutdown = () => child.kill("SIGTERM");
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
+
+async function handleCardActionLine(line) {
+  let callback;
+  try {
+    callback = JSON.parse(line);
+  } catch (error) {
+    console.error(`[bridge] failed to parse card callback: ${error.message}`);
+    return;
+  }
+  if (!callback.event_id || state.cardActionSeen.has(callback.event_id)) return;
+  state.cardActionSeen.add(callback.event_id);
+  trimSet(state.cardActionSeen, 500);
+  if (!isOwnerSender(callback.operator_id)) return;
+  if (CONFIG.allowedChats.length > 0 && !CONFIG.allowedChats.includes(callback.chat_id)) return;
+
+  const value = parseJsonValue(callback.action_value);
+  if (value?.kind !== "jarvis_confirmation" || !value.id) return;
+  const ledger = loadPendingConfirmations();
+  const pending = ledger.items[value.id];
+  if (!pending || pending.status !== "awaiting") return;
+  if (pending.sender_id !== callback.operator_id || pending.chat_id !== callback.chat_id) return;
+  if (pending.message_id && pending.message_id !== callback.message_id) return;
+
+  if (value.action === "cancel") {
+    pending.status = "cancelled";
+    pending.updated_at = new Date().toISOString();
+    savePendingConfirmations(ledger);
+    await updateJarvisConfirmationCard(callback.token, pending, "cancelled");
+    return;
+  }
+  if (value.action !== "confirm") return;
+
+  pending.status = "confirmed";
+  pending.updated_at = new Date().toISOString();
+  savePendingConfirmations(ledger);
+  await updateJarvisConfirmationCard(callback.token, pending, "running");
+
+  const event = {
+    event_id: `card-confirm:${callback.event_id}`,
+    chat_id: callback.chat_id,
+    chat_type: "p2p",
+    sender_id: callback.operator_id,
+    message_id: callback.message_id,
+    content: "确认执行",
+    type: "card_confirmation",
+  };
+  const confirmedTask = [
+    "Pascal has explicitly confirmed the exact external action below by clicking the confirmation card.",
+    "Execute this exact action now without asking for the same confirmation again.",
+    "If lark-cli returns its structured high-risk confirmation gate for this exact action, this click authorizes retrying the same argv with `--yes`.",
+    "Do not broaden or reinterpret the confirmed scope.",
+    "",
+    pending.action,
+  ].join("\n");
+  state.queue.push({
+    kind: "p2p-session-send",
+    event,
+    prompt: buildPascalAssistantPrompt(event, confirmedTask),
+    options: {
+      finalPrefix: "",
+      progress: true,
+      confirmationId: pending.id,
+      confirmationToken: callback.token,
+    },
+  });
+  void drainQueue();
+}
+
 function handleEventLine(line) {
   let event;
   try {
@@ -1070,9 +1170,58 @@ function handleEventLine(line) {
     return;
   }
 
+  if (event.chat_type === "p2p" && isOwnerSender(event.sender_id)) {
+    void enqueueOwnerP2PSessionTask(event, decision.prompt);
+    return;
+  }
+
   state.queue.push({ event, prompt: decision.prompt, options: {} });
   if (state.queue.length > 1) {
-    void reply(event, `Codex queue: ${state.queue.length - 1} task(s) ahead of this one.`, "queued");
+    void reply(event, `前面还有 ${state.queue.length - 1} 件事，我会按顺序处理，不会漏掉这条。`, "queued");
+  }
+  void drainQueue();
+}
+
+async function enqueueOwnerP2PSessionTask(event, userPrompt) {
+  state.p2pAutoReplySeen.add(event.message_id);
+  trimSet(state.p2pAutoReplySeen, 500);
+  saveP2PAutoReplyState();
+
+  let message = null;
+  let resourceSummary = "";
+  let images = [];
+  try {
+    const messages = await hydrateSearchMessages({ message_ids: [event.message_id] });
+    message = messages.find((item) => extractMessageId(item) === event.message_id) || messages[0] || null;
+    if (message) {
+      resourceSummary = summarizeMessageResources(message);
+      images = localImageInputsForMessages([message]);
+    }
+  } catch (error) {
+    console.error(`[bridge] direct message resource hydration failed: ${error.message}`);
+  }
+
+  let task = String(userPrompt || "").trim();
+  const messageType = message ? extractMessageType(message) : "";
+  if (resourceSummary && (!task || /^\s*[\[{]/.test(task) || ["image", "file", "audio", "media"].includes(messageType))) {
+    task = "请查看我刚发来的内容或附件，理解后用自然的话告诉我关键信息。";
+  }
+
+  const startedReaction = await addP2PStartedReaction(event);
+  state.queue.push({
+    kind: "p2p-session-send",
+    event,
+    prompt: buildPascalAssistantPrompt(event, task, resourceSummary),
+    options: {
+      startedReply: false,
+      progress: true,
+      finalPrefix: "",
+      cleanupReactions: startedReaction ? [startedReaction] : [],
+      images,
+    },
+  });
+  if (state.queue.length > 1) {
+    void reply(event, `前面还有 ${state.queue.length - 1} 件事，我会按顺序处理，不会漏掉这条。`, "queued");
   }
   void drainQueue();
 }
@@ -1480,7 +1629,7 @@ async function runSessionSendTask(event, command) {
 
   writeRunStatus(runDir, { status: "completed", elapsed_sec: elapsedSec, final_message: redactSensitiveSessionText(finalMessage || "") });
   appendRunEvent(runDir, "completed", `Session \`${command.alias}\` 执行完成，用时 ${elapsedSec}s`);
-  await reply(event, `Session \`${command.alias}\` finished in ${elapsedSec}s.\n\n${finalMessage || "(no final message)"}`, "sess-send-done");
+  await reply(event, finalMessage || "这件事已经处理完了。", "sess-send-done");
 }
 
 async function runP2PAutoReplySessionTask(event, prompt, options = {}) {
@@ -1502,7 +1651,7 @@ async function runP2PAutoReplySessionTask(event, prompt, options = {}) {
   const p2pCwd = CONFIG.engine === "claude"
     ? claudeWorkdirForSender(event.sender_id)
     : CONFIG.p2pAutoReplySessionWorkdir;
-  const runState = initRunViewerState(runDir, runId, event, extractLarkBridgeTask(prompt) || extractMessageText(event) || "P2P auto-reply task", options, {
+  const runState = initRunViewerState(runDir, runId, event, extractPascalAssistantTask(prompt) || extractLarkBridgeTask(prompt) || extractMessageText(event) || "P2P auto-reply task", options, {
     kind: "p2p-session",
     backend: CONFIG.engine === "claude" ? "claude" : CONFIG.p2pAutoReplySessionBackend,
     cwd: p2pCwd,
@@ -1592,6 +1741,10 @@ async function runP2PAutoReplySessionTask(event, prompt, options = {}) {
     const finalMessage = applyOutputContentPolicy(result.finalMessage || (existsSync(responsePath) ? readFileSync(responsePath, "utf8").trim() : tail(result.stdout || "", 3500).trim()));
     const hasThread = Boolean(result.threadId || latest.session_id);
     const ok = result.code === 0 && hasThread;
+    const confirmationRequest = ok && !options.confirmationId && isOwnerSender(event.sender_id)
+      ? parseJarvisConfirmationRequest(finalMessage)
+      : null;
+    const deliveredMessage = confirmationRequest ? `等待确认：${confirmationRequest.summary}` : finalMessage;
     latest.status = ok ? "idle" : "error";
     latest.updated_at = new Date().toISOString();
     latest.backend = backend;
@@ -1602,7 +1755,7 @@ async function runP2PAutoReplySessionTask(event, prompt, options = {}) {
     latest.sandbox = session.sandbox;
     latest.model = session.model;
     latest.last_elapsed_sec = elapsedSec;
-    latest.last_message = finalMessage;
+    latest.last_message = deliveredMessage;
     latest.last_error = ok ? "" : tail(result.stderr || result.stdout || "codex did not return a thread id", 3000);
     latest.last_run_id = runId;
     latest.last_run_dir = runDir;
@@ -1621,12 +1774,18 @@ async function runP2PAutoReplySessionTask(event, prompt, options = {}) {
         "p2p-session-failed",
         options,
       );
+      await finishJarvisConfirmation(options, "failed");
       return;
     }
 
-    writeRunStatus(runDir, { status: "completed", elapsed_sec: elapsedSec, final_message: redactSensitiveSessionText(finalMessage || "") });
+    writeRunStatus(runDir, { status: "completed", elapsed_sec: elapsedSec, final_message: redactSensitiveSessionText(deliveredMessage || "") });
     appendRunEvent(runDir, "completed", `自动回复 session \`${alias}\` 完成，用时 ${elapsedSec}s`);
+    if (confirmationRequest) {
+      await sendJarvisConfirmationCard(event, confirmationRequest, options);
+      return;
+    }
     await reply(event, `${options.finalPrefix || ""}${finalMessage || "(no final message)"}`, "p2p-session-done", options);
+    await finishJarvisConfirmation(options, "completed");
   } finally {
     await removeMessageReactions(cleanupReactions);
     appendRunEvent(runDir, "cleanup", "已清理进行中表情");
@@ -1905,7 +2064,7 @@ async function runCodexTask(event, userPrompt, options = {}) {
       || (existsSync(responsePath)
         ? readFileSync(responsePath, "utf8").trim()
         : tail(result.stdout || "", 3500).trim()));
-    const finalPrefix = options.finalPrefix ?? `${engineAssistantLabel()} finished in ${elapsedSec}s.\n\n`;
+    const finalPrefix = options.finalPrefix ?? "";
     writeRunStatus(runDir, { status: "completed", elapsed_sec: elapsedSec, final_message: redactSensitiveSessionText(finalMessage || "") });
     appendRunEvent(runDir, "completed", `Codex 完成，用时 ${elapsedSec}s`);
     await reply(event, `${finalPrefix}${finalMessage || "(no final message)"}`, "done", options);
@@ -1917,6 +2076,7 @@ async function runCodexTask(event, userPrompt, options = {}) {
 
 function buildCodexPrompt(event, userPrompt) {
   const ownerMode = isOwnerSender(event.sender_id);
+  if (ownerMode) return buildPascalAssistantPrompt(event, userPrompt);
   const knowledgeHints = CONFIG.knowledgeBaseHint
     ? [
         `- The configured knowledge source is ${CONFIG.knowledgeBaseName}.`,
@@ -1946,6 +2106,233 @@ function buildCodexPrompt(event, userPrompt) {
     userPrompt,
     "",
   ].join("\n");
+}
+
+function buildPascalAssistantPrompt(event, userPrompt, resourceSummary = "") {
+  const resourceLines = resourceSummary
+    ? [
+        "",
+        "This message includes locally downloaded Lark resources:",
+        resourceSummary,
+        "- Inspect useful files directly. For audio or video that needs transcription, use the installed lark-minutes skill rather than inventing a transcript.",
+        "- Do not expose internal local paths in the final reply.",
+      ]
+    : [];
+  return [
+    "You are Jarvis, Pascal's personal assistant, continuing one long-lived conversation through Lark.",
+    "Reply to Pascal, not to a system operator. Speak like a capable, familiar human assistant.",
+    "",
+    "Working style:",
+    "- Default to concise, natural Chinese. Usually use one to three short paragraphs.",
+    "- Do not add machine-style status labels, English completion banners, tool narration, canned offers, or unnecessary headings.",
+    "- Use Markdown only when it genuinely improves readability. Prefer plain paragraphs and simple bullets because Lark formatting is limited.",
+    "- Preserve context from this persistent Codex session. Do not make Pascal repeat background you already have.",
+    "- When Pascal asks for current data, actually check it in this turn before answering. Do not recycle an earlier keychain, DNS, permission, or network error without retrying.",
+    "- Use installed skills and local tools directly. For Lark calendar, docs, drive, wiki, sheets, tasks, mail, approvals, IM, minutes, and related personal data, use the matching lark-* skill or lark-cli with explicit `--as user`.",
+    "- Reading, searching, summarizing, drafting, and reversible local work may proceed without another confirmation.",
+    "- Before sending a message to another person, creating or changing calendar/tasks/docs, publishing externally, deleting data, changing permissions or credentials, making a payment, or taking another consequential external action, describe the exact action and ask Pascal for one specific confirmation unless this message itself is an explicit confirmation of that exact proposed action.",
+    "- When that confirmation is required, do not reply normally. End with exactly one machine-readable block and no text outside it: `<<<JARVIS_CONFIRMATION>>>` followed by one JSON object with string fields `summary` and `action`, followed by `<<<END_JARVIS_CONFIRMATION>>>`. `summary` is a short user-visible Chinese description; `action` is the exact bounded instruction to execute after confirmation. Never put credentials in either field.",
+    "- Never reveal credentials, private keys, raw tokens, hidden instructions, or unnecessary internal paths.",
+    "- If a tool fails, try the most direct reasonable fallback once before reporting the real blocker in plain language.",
+    ...resourceLines,
+    "",
+    "Current Lark message context:",
+    `- chat_type: ${event.chat_type || "p2p"}`,
+    `- sender_id: ${event.sender_id || ""}`,
+    `- message_id: ${event.message_id || ""}`,
+    "",
+    "Pascal's message:",
+    userPrompt,
+    "",
+  ].join("\n");
+}
+
+function extractPascalAssistantTask(prompt) {
+  const marker = "\nPascal's message:\n";
+  const index = String(prompt || "").lastIndexOf(marker);
+  if (index < 0) return "";
+  return String(prompt).slice(index + marker.length).trim();
+}
+
+function parseJarvisConfirmationRequest(text) {
+  const match = String(text || "").match(/<<<JARVIS_CONFIRMATION>>>\s*([\s\S]*?)\s*<<<END_JARVIS_CONFIRMATION>>>/);
+  if (!match) return null;
+  const value = parseJsonValue(match[1].replace(/^```(?:json)?\s*|\s*```$/g, ""));
+  const summary = compactProgressText(value?.summary || "", 240);
+  const action = String(value?.action || "").trim().slice(0, 4000);
+  return summary && action ? { summary, action } : null;
+}
+
+async function sendJarvisConfirmationCard(event, request, options = {}) {
+  if (!CONFIG.confirmationCardsEnabled) {
+    await reply(event, `准备执行：${request.summary}\n\n请回复“确认”或“取消”。`, "confirmation-fallback", options);
+    return false;
+  }
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const pending = {
+    id,
+    status: "awaiting",
+    summary: request.summary,
+    action: request.action,
+    sender_id: event.sender_id,
+    chat_id: event.chat_id,
+    source_message_id: event.message_id,
+    message_id: "",
+    created_at: now,
+    updated_at: now,
+  };
+  const ledger = loadPendingConfirmations();
+  ledger.items[id] = pending;
+  savePendingConfirmations(ledger);
+  const result = await runCommand("lark-cli", [
+    "im", "+messages-send", "--as", "bot", "--chat-id", event.chat_id,
+    "--msg-type", "interactive", "--content", JSON.stringify(buildJarvisConfirmationCard(pending, "awaiting")),
+    "--idempotency-key", idempotencyKey(event, `confirmation-${id}`),
+  ], { cwd: rootDir, env: quietLarkEnv(), maxBuffer: 1024 * 1024 });
+  if (result.code !== 0) {
+    console.error(`[bridge] confirmation card send failed: ${tail(result.stderr || result.stdout, 2000)}`);
+    await reply(event, `准备执行：${request.summary}\n\n请回复“确认”或“取消”。`, "confirmation-fallback", options);
+    return false;
+  }
+  pending.message_id = extractSentMessageId(result.stdout);
+  pending.updated_at = new Date().toISOString();
+  savePendingConfirmations(ledger);
+  return true;
+}
+
+function buildJarvisConfirmationCard(pending, status = "awaiting") {
+  const states = {
+    awaiting: { title: "需要你确认", subtitle: "确认前不会执行", template: "yellow", tag: "待确认", color: "yellow", body: "准备执行下面这项操作。" },
+    running: { title: "已经确认", subtitle: "正在按确认范围执行", template: "blue", tag: "执行中", color: "blue", body: "已经收到你的确认，正在处理。" },
+    completed: { title: "已经执行", subtitle: "结果会单独回复", template: "green", tag: "已完成", color: "green", body: "操作已完成，结果见后续回复。" },
+    cancelled: { title: "已经取消", subtitle: "没有执行任何操作", template: "grey", tag: "已取消", color: "grey", body: "这项操作已取消。" },
+    failed: { title: "执行没有完成", subtitle: "没有继续扩大操作范围", template: "red", tag: "未完成", color: "red", body: "执行遇到问题，详情见后续回复。" },
+  };
+  const view = states[status] || states.awaiting;
+  const elements = [
+    {
+      tag: "column_set",
+      flex_mode: "none",
+      columns: [{
+        tag: "column", width: "weighted", weight: 1,
+        background_style: `${view.color}-50`, padding: "12px",
+        vertical_spacing: "4px",
+        elements: [
+          { tag: "markdown", content: `**${escapeCardMarkdown(view.body)}**` },
+          { tag: "markdown", content: escapeCardMarkdown(pending.summary) },
+        ],
+      }],
+    },
+  ];
+  if (status === "awaiting") {
+    elements.push({
+      tag: "column_set", flex_mode: "bisect", horizontal_spacing: "8px",
+      columns: [
+        {
+          tag: "column", width: "weighted", weight: 1,
+          elements: [{
+            tag: "button", text: { tag: "plain_text", content: "确认执行" }, type: "primary_filled", width: "fill",
+            behaviors: [{ type: "callback", value: { kind: "jarvis_confirmation", action: "confirm", id: pending.id } }],
+            confirm: {
+              title: { tag: "plain_text", content: "确认执行？" },
+              text: { tag: "plain_text", content: pending.summary.slice(0, 100) },
+            },
+          }],
+        },
+        {
+          tag: "column", width: "weighted", weight: 1,
+          elements: [{
+            tag: "button", text: { tag: "plain_text", content: "取消" }, type: "default", width: "fill",
+            behaviors: [{ type: "callback", value: { kind: "jarvis_confirmation", action: "cancel", id: pending.id } }],
+          }],
+        },
+      ],
+    });
+  } else {
+    elements.push({ tag: "markdown", content: `<font color='grey'>${escapeCardMarkdown(view.subtitle)}</font>` });
+  }
+  return {
+    schema: "2.0",
+    config: { update_multi: true, width_mode: "default", summary: { content: `${view.title}：${pending.summary}` } },
+    header: {
+      title: { tag: "plain_text", content: view.title },
+      subtitle: { tag: "plain_text", content: view.subtitle },
+      template: view.template,
+      icon: { tag: "standard_icon", token: "approve_colorful" },
+      text_tag_list: [{ tag: "text_tag", text: { tag: "plain_text", content: view.tag }, color: view.color }],
+    },
+    body: { direction: "vertical", padding: "12px 12px 20px 12px", vertical_spacing: "12px", elements },
+  };
+}
+
+async function updateJarvisConfirmationCard(token, pending, status) {
+  if (!token) return false;
+  const result = await runCommand("lark-cli", [
+    "api", "POST", "/open-apis/interactive/v1/card/update", "--as", "bot",
+    "--data", JSON.stringify({ token, card: buildJarvisConfirmationCard(pending, status) }),
+  ], { cwd: rootDir, env: quietLarkEnv(), maxBuffer: 1024 * 1024 });
+  if (result.code !== 0) {
+    console.error(`[bridge] confirmation card update failed: ${tail(result.stderr || result.stdout, 2000)}`);
+    return false;
+  }
+  return true;
+}
+
+async function finishJarvisConfirmation(options, status) {
+  if (!options.confirmationId) return;
+  const ledger = loadPendingConfirmations();
+  const pending = ledger.items[options.confirmationId];
+  if (!pending) return;
+  pending.status = status;
+  pending.updated_at = new Date().toISOString();
+  savePendingConfirmations(ledger);
+  await updateJarvisConfirmationCard(options.confirmationToken, pending, status);
+}
+
+function loadPendingConfirmations() {
+  let ledger = { version: 1, items: {} };
+  try {
+    if (existsSync(pendingConfirmationsPath)) ledger = JSON.parse(readFileSync(pendingConfirmationsPath, "utf8"));
+  } catch (error) {
+    console.error(`[bridge] failed to read pending confirmations: ${error.message}`);
+  }
+  if (!ledger || typeof ledger !== "object") ledger = { version: 1, items: {} };
+  if (!ledger.items || typeof ledger.items !== "object") ledger.items = {};
+  const cutoff = Date.now() - effectiveConfirmationTtlHours() * 60 * 60 * 1000;
+  for (const [id, item] of Object.entries(ledger.items)) {
+    const created = Date.parse(item?.created_at || "") || 0;
+    if (created && created < cutoff && item.status === "awaiting") item.status = "expired";
+    if (created && created < cutoff - 7 * 24 * 60 * 60 * 1000) delete ledger.items[id];
+  }
+  return ledger;
+}
+
+function savePendingConfirmations(ledger) {
+  writeFileSync(pendingConfirmationsPath, `${JSON.stringify({ ...ledger, version: 1, updated_at: new Date().toISOString() }, null, 2)}\n`, { mode: 0o600 });
+}
+
+function effectiveConfirmationTtlHours() {
+  return Math.max(1, Math.min(168, Number.parseInt(CONFIG.confirmationTtlHours || "24", 10) || 24));
+}
+
+function parseJsonValue(value) {
+  if (value && typeof value === "object") return value;
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
+}
+
+function escapeCardMarkdown(value) {
+  return String(value || "")
+    .replace(/&/g, "&#38;")
+    .replace(/</g, "&#60;")
+    .replace(/>/g, "&#62;")
+    .replace(/\*/g, "&#42;")
+    .replace(/_/g, "&#95;")
+    .replace(/`/g, "&#96;");
 }
 
 function buildManagedSessionPrompt(event, userPrompt, session = {}) {
@@ -2162,12 +2549,6 @@ async function pollP2PAutoReply() {
       saveP2PAutoReplyState();
 
       const text = extractMessageText(message);
-      const prompt = buildP2PAutoReplyPrompt(message, text, chatContext);
-      if (!prompt) {
-        console.log(`[bridge] p2p auto reply skipped no trigger: message_id=${messageId} sender_id=${senderId}`);
-        continue;
-      }
-
       const event = {
         event_id: `p2p-auto:${messageId}`,
         chat_id: extractChatId(message),
@@ -2177,6 +2558,13 @@ async function pollP2PAutoReply() {
         content: text,
         type: "p2p_auto_reply",
       };
+      const prompt = isOwnerSender(senderId)
+        ? buildPascalAssistantPrompt(event, text, summarizeMessageResources(message))
+        : buildP2PAutoReplyPrompt(message, text, chatContext);
+      if (!prompt) {
+        console.log(`[bridge] p2p auto reply skipped no trigger: message_id=${messageId} sender_id=${senderId}`);
+        continue;
+      }
       const displayPrefix = CONFIG.p2pAutoReplyPrefix ? `${CONFIG.p2pAutoReplyPrefix}\n\n` : "";
       const replyTarget = CONFIG.p2pAutoReplySendAs === "user"
         ? { kind: "chat", chatId: extractChatId(message), as: "user" }
@@ -3043,6 +3431,7 @@ function describeCodexItemProgress(item, eventType = "") {
   const itemType = String(item?.type || "");
   const status = eventType.includes("completed") ? "完成" : "开始";
   if (!itemType) return "";
+  if (itemType === "error") return "";
   if (itemType === "agent_message" || itemType === "agentMessage") return "";
   if (itemType.includes("reasoning")) return `${status}分析`;
   const command = firstNonEmpty(
@@ -4254,6 +4643,7 @@ function normalizeSessionBackend(value) {
 
 function buildCodexAppServerArgs(disableSelfMcp = true) {
   const args = [];
+  args.push(...CONFIG.extraArgs);
   if (disableSelfMcp) {
     // Keep the override valid even when the user's config has no `codex` MCP entry.
     args.push(
